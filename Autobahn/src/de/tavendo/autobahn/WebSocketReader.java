@@ -152,10 +152,6 @@ public class WebSocketReader extends Thread {
 
             // now check protocol compliance
 
-            if (rsv != 0) {
-               throw new WebSocketException("RSV != 0 and no extension negotiated");
-            }
-
             if (masked) {
                // currently, we don't allow this. need to see whats the final spec.
                throw new WebSocketException("masked server frame");
