@@ -3,3 +3,9 @@ gen/*
 !gen/PLACEHOLDER
 *.jar
 !libs/*
+.gradle
+/local.properties
+/.idea/workspace.xml
+/.idea/libraries
+.DS_Store
+/build
