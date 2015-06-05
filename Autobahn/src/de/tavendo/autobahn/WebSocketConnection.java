@@ -18,18 +18,19 @@
 
 package de.tavendo.autobahn;
 
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Message;
+import android.util.Log;
+
+import org.apache.http.message.BasicNameValuePair;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.channels.SocketChannel;
 import java.util.List;
-import org.apache.http.message.BasicNameValuePair;
-
-import android.os.Handler;
-import android.os.HandlerThread;
-import android.os.Message;
-import android.util.Log;
 
 public class WebSocketConnection implements WebSocket {
 
@@ -154,6 +155,10 @@ public class WebSocketConnection implements WebSocket {
       mWriter.forward(new WebSocketMessage.BinaryMessage(payload));
    }
 
+
+   public void sendPingMessage(byte[] payload) {
+       mWriter.forward(new WebSocketMessage.Ping(payload));
+   }
 
    public boolean isConnected() {
       return mTransportChannel != null && mTransportChannel.isConnected();
@@ -419,10 +424,13 @@ public class WebSocketConnection implements WebSocket {
 
             } else if (msg.obj instanceof WebSocketMessage.Pong) {
 
-               @SuppressWarnings("unused")
-               WebSocketMessage.Pong pong = (WebSocketMessage.Pong) msg.obj;
+               final WebSocketMessage.Pong pongMessage = (WebSocketMessage.Pong) msg.obj;
 
-               if (DEBUG) Log.d(TAG, "WebSockets Pong received");
+               if (mWsHandler != null) {
+                  mWsHandler.onPongMessage(pongMessage.mPayload);
+               } else {
+                  if (DEBUG) Log.d(TAG, "could not call onPongMessage() .. handler already NULL");
+               }
 
             } else if (msg.obj instanceof WebSocketMessage.Close) {
 

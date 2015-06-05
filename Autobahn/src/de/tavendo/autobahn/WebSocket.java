@@ -77,9 +77,16 @@ public interface WebSocket {
 	   /**
 	    * Fired when a binary message has been received.
 	    *
-	    * @param payload    Binar message payload or null (empty payload).
+	    * @param payload    Binary message payload or null (empty payload).
 	    */
 	   public void onBinaryMessage(byte[] payload);
+
+       /**
+        * Fired when a PONG message is received from the server.
+        *
+        * @param payload    Binary message payload or null (empty payload).
+        */
+       public void onPongMessage(byte[] payload);
    }
 
    public void connect(String wsUri, ConnectionHandler wsHandler) throws WebSocketException;
@@ -89,4 +96,5 @@ public interface WebSocket {
    public void sendBinaryMessage(byte[] payload);
    public void sendRawTextMessage(byte[] payload);
    public void sendTextMessage(String payload);
+   public void sendPingMessage(byte[] payload);
 }
