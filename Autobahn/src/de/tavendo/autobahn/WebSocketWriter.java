@@ -19,11 +19,13 @@
 package de.tavendo.autobahn;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.ref.WeakReference;
+import java.net.Socket;
 import java.net.SocketException;
-import java.nio.channels.SocketChannel;
+import java.nio.ByteBuffer;
 import java.util.Random;
 
-import org.apache.http.NameValuePair;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -38,448 +40,423 @@ import android.util.Log;
  * background thread) so that it can be formatted and sent out on the
  * underlying TCP socket.
  */
-public class WebSocketWriter extends Handler {
-
-   private static final boolean DEBUG = true;
-   private static final String TAG = WebSocketWriter.class.getName();
-
-   /// Random number generator for handshake key and frame mask generation.
-   private final Random mRng = new Random();
-
-   /// Connection master.
-   private final Handler mMaster;
-
-   /// Message looper this object is running on.
-   private final Looper mLooper;
-
-   /// The NIO socket channel created on foreground thread.
-   private final SocketChannel mSocket;
-
-   /// WebSockets options.
-   private final WebSocketOptions mOptions;
-
-   /// The send buffer that holds data to send on socket.
-   private final ByteBufferOutputStream mBuffer;
-
-
-   /**
-    * Create new WebSockets background writer.
-    *
-    * @param looper    The message looper of the background thread on which
-    *                  this object is running.
-    * @param master    The message handler of master (foreground thread).
-    * @param socket    The socket channel created on foreground thread.
-    * @param options   WebSockets connection options.
-    */
-   public WebSocketWriter(Looper looper, Handler master, SocketChannel socket, WebSocketOptions options) {
-
-      super(looper);
-
-      mLooper = looper;
-      mMaster = master;
-      mSocket = socket;
-      mOptions = options;
-      mBuffer = new ByteBufferOutputStream(options.getMaxFramePayloadSize() + 14, 4*64*1024);
-
-      if (DEBUG) Log.d(TAG, "created");
-   }
-
-
-   /**
-    * Call this from the foreground (UI) thread to make the writer
-    * (running on background thread) send a WebSocket message on the
-    * underlying TCP.
-    *
-    * @param message       Message to send to WebSockets writer. An instance of the message
-    *                      classes inside WebSocketMessage or another type which then needs
-    *                      to be handled within processAppMessage() (in a class derived from
-    *                      this class).
-    */
-   public void forward(Object message) {
-
-      Message msg = obtainMessage();
-      msg.obj = message;
-      sendMessage(msg);
-   }
-
-
-   /**
-    * Notify the master (foreground thread).
-    *
-    * @param message       Message to send to master.
-    */
-   private void notify(Object message) {
-
-      Message msg = mMaster.obtainMessage();
-      msg.obj = message;
-      mMaster.sendMessage(msg);
-   }
-
-
-   /**
-    * Create new key for WebSockets handshake.
-    *
-    * @return WebSockets handshake key (Base64 encoded).
-    */
-   private String newHandshakeKey() {
-      final byte[] ba = new byte[16];
-      mRng.nextBytes(ba);
-      return Base64.encodeToString(ba, Base64.NO_WRAP);
-   }
-
-
-   /**
-    * Create new (random) frame mask.
-    *
-    * @return Frame mask (4 octets).
-    */
-   private byte[] newFrameMask() {
-      final byte[] ba = new byte[4];
-      mRng.nextBytes(ba);
-      return ba;
-   }
-
-
-   /**
-    * Send WebSocket client handshake.
-    */
-   private void sendClientHandshake(WebSocketMessage.ClientHandshake message) throws IOException {
-
-      // write HTTP header with handshake
-      String path;
-      if (message.mQuery != null) {
-         path = message.mPath + "?" + message.mQuery;
-      } else {
-         path = message.mPath;
-      }
-      mBuffer.write("GET " + path + " HTTP/1.1");
-      mBuffer.crlf();
-      mBuffer.write("Host: " + message.mHost);
-      mBuffer.crlf();
-      mBuffer.write("Upgrade: WebSocket");
-      mBuffer.crlf();
-      mBuffer.write("Connection: Upgrade");
-      mBuffer.crlf();
-
-      mBuffer.write("Sec-WebSocket-Key: " + newHandshakeKey());
-      mBuffer.crlf();
-
-      if (message.mOrigin != null && !message.mOrigin.equals("")) {
-         mBuffer.write("Origin: " + message.mOrigin);
-         mBuffer.crlf();
-      }
-
-      if (message.mSubprotocols != null && message.mSubprotocols.length > 0) {
-         mBuffer.write("Sec-WebSocket-Protocol: ");
-         for (int i = 0; i < message.mSubprotocols.length; ++i) {
-            mBuffer.write(message.mSubprotocols[i]);
-            if (i != message.mSubprotocols.length-1) {
-               mBuffer.write(", ");
-            }
-         }
-         mBuffer.crlf();
-      }
-
-      mBuffer.write("Sec-WebSocket-Version: 13");
-      mBuffer.crlf();
-
-      // Header injection      
-      if (message.mHeaderList != null) {
-          for (NameValuePair pair : message.mHeaderList) {
-        	  mBuffer.write( pair.getName() + ":" + pair.getValue() );
-        	  mBuffer.crlf();
-          }
-      }           
-      mBuffer.crlf();
-   }
-
-
-   /**
-    * Send WebSockets close.
-    */
-   private void sendClose(WebSocketMessage.Close message) throws IOException, WebSocketException {
-
-      if (message.mCode > 0) {
-
-         byte[] payload = null;
-
-         if (message.mReason != null && !message.mReason.equals("")) {
-            byte[] pReason = message.mReason.getBytes("UTF-8");
-            payload = new byte[2 + pReason.length];
-            for (int i = 0; i < pReason.length; ++i) {
-               payload[i + 2] = pReason[i];
-            }
-         } else {
-            payload = new byte[2];
-         }
-
-         if (payload != null && payload.length > 125) {
-            throw new WebSocketException("close payload exceeds 125 octets");
-         }
-
-         payload[0] = (byte)((message.mCode >> 8) & 0xff);
-         payload[1] = (byte)(message.mCode & 0xff);
-
-         sendFrame(8, true, payload);
-
-      } else {
-
-         sendFrame(8, true, null);
-      }
-   }
-
-
-   /**
-    * Send WebSockets ping.
-    */
-   private void sendPing(WebSocketMessage.Ping message) throws IOException, WebSocketException {
-      if (message.mPayload != null && message.mPayload.length > 125) {
-         throw new WebSocketException("ping payload exceeds 125 octets");
-      }
-      sendFrame(9, true, message.mPayload);
-   }
-
-
-   /**
-    * Send WebSockets pong. Normally, unsolicited Pongs are not used,
-    * but Pongs are only send in response to a Ping from the peer.
-    */
-   private void sendPong(WebSocketMessage.Pong message) throws IOException, WebSocketException {
-      if (message.mPayload != null && message.mPayload.length > 125) {
-         throw new WebSocketException("pong payload exceeds 125 octets");
-      }
-      sendFrame(10, true, message.mPayload);
-   }
-
-
-   /**
-    * Send WebSockets binary message.
-    */
-   private void sendBinaryMessage(WebSocketMessage.BinaryMessage message) throws IOException, WebSocketException {
-      if (message.mPayload.length > mOptions.getMaxMessagePayloadSize()) {
-         throw new WebSocketException("message payload exceeds payload limit");
-      }
-      sendFrame(2, true, message.mPayload);
-   }
-
-
-   /**
-    * Send WebSockets text message.
-    */
-   private void sendTextMessage(WebSocketMessage.TextMessage message) throws IOException, WebSocketException {
-      byte[] payload = message.mPayload.getBytes("UTF-8");
-      if (payload.length > mOptions.getMaxMessagePayloadSize()) {
-         throw new WebSocketException("message payload exceeds payload limit");
-      }
-      sendFrame(1, true, payload);
-   }
-
-
-   /**
-    * Send WebSockets binary message.
-    */
-   private void sendRawTextMessage(WebSocketMessage.RawTextMessage message) throws IOException, WebSocketException {
-      if (message.mPayload.length > mOptions.getMaxMessagePayloadSize()) {
-         throw new WebSocketException("message payload exceeds payload limit");
-      }
-      sendFrame(1, true, message.mPayload);
-   }
-
-
-   /**
-    * Sends a WebSockets frame. Only need to use this method in derived classes which implement
-    * more message types in processAppMessage(). You need to know what you are doing!
-    *
-    * @param opcode     The WebSocket frame opcode.
-    * @param fin        FIN flag for WebSocket frame.
-    * @param payload    Frame payload or null.
-    */
-   protected void sendFrame(int opcode, boolean fin, byte[] payload) throws IOException {
-      if (payload != null) {
-         sendFrame(opcode, fin, payload, 0, payload.length);
-      } else {
-         sendFrame(opcode, fin, null, 0, 0);
-      }
-   }
-
-
-   /**
-    * Sends a WebSockets frame. Only need to use this method in derived classes which implement
-    * more message types in processAppMessage(). You need to know what you are doing!
-    *
-    * @param opcode     The WebSocket frame opcode.
-    * @param fin        FIN flag for WebSocket frame.
-    * @param payload    Frame payload or null.
-    * @param offset     Offset within payload of the chunk to send.
-    * @param length     Length of the chunk within payload to send.
-    */
-   protected void sendFrame(int opcode, boolean fin, byte[] payload, int offset, int length) throws IOException {
-
-      // first octet
-      byte b0 = 0;
-      if (fin) {
-         b0 |= (byte) (1 << 7);
-      }
-      b0 |= (byte) opcode;
-      mBuffer.write(b0);
-
-      // second octet
-      byte b1 = 0;
-      if (mOptions.getMaskClientFrames()) {
-         b1 = (byte) (1 << 7);
-      }
-
-      long len = length;
-
-      // extended payload length
-      if (len <= 125) {
-         b1 |= (byte) len;
-         mBuffer.write(b1);
-      } else if (len <= 0xffff) {
-         b1 |= (byte) (126 & 0xff);
-         mBuffer.write(b1);
-         mBuffer.write(new byte[] {(byte)((len >> 8) & 0xff),
-                                   (byte)(len & 0xff)});
-      } else {
-         b1 |= (byte) (127 & 0xff);
-         mBuffer.write(b1);
-         mBuffer.write(new byte[] {(byte)((len >> 56) & 0xff),
-                                   (byte)((len >> 48) & 0xff),
-                                   (byte)((len >> 40) & 0xff),
-                                   (byte)((len >> 32) & 0xff),
-                                   (byte)((len >> 24) & 0xff),
-                                   (byte)((len >> 16) & 0xff),
-                                   (byte)((len >> 8)  & 0xff),
-                                   (byte)(len         & 0xff)});
-      }
-
-      byte mask[] = null;
-      if (mOptions.getMaskClientFrames()) {
-         // a mask is always needed, even without payload
-         mask = newFrameMask();
-         mBuffer.write(mask[0]);
-         mBuffer.write(mask[1]);
-         mBuffer.write(mask[2]);
-         mBuffer.write(mask[3]);
-      }
-
-      if (len > 0) {
-         if (mOptions.getMaskClientFrames()) {
-            /// \todo optimize masking
-            /// \todo masking within buffer of output stream
-            for (int i = 0; i < len; ++i) {
-               payload[i + offset] ^= mask[i % 4];
-            }
-         }
-         mBuffer.write(payload, offset, length);
-      }
-   }
-
-
-   /**
-    * Process message received from foreground thread. This is called from
-    * the message looper set up for the background thread running this writer.
-    *
-    * @param msg     Message from thread message queue.
-    */
-   @Override
-   public void handleMessage(Message msg) {
-
-      try {
-
-         // clear send buffer
-         mBuffer.clear();
-
-         // process message from master
-         processMessage(msg.obj);
-
-         // send out buffered data
-         mBuffer.flip();
-         while (mBuffer.remaining() > 0) {
-            // this can block on socket write
-            @SuppressWarnings("unused")
-            int written = mSocket.write(mBuffer.getBuffer());
-         }
-
-      } catch (SocketException e) {
-    	  
-    	  if (DEBUG) Log.d(TAG, "run() : SocketException (" + e.toString() + ")");
-    	  
-    	  // wrap the exception and notify master
-    	  notify(new WebSocketMessage.ConnectionLost());
-      } catch (Exception e) {
-
-         if (DEBUG) e.printStackTrace();
-
-         // wrap the exception and notify master
-         notify(new WebSocketMessage.Error(e));
-      }
-   }
-
-
-   /**
-    * Process WebSockets or control message from master. Normally,
-    * there should be no reason to override this. If you do, you
-    * need to know what you are doing.
-    *
-    * @param msg     An instance of the message types within WebSocketMessage
-    *                or a message that is handled in processAppMessage().
-    */
-   protected void processMessage(Object msg) throws IOException, WebSocketException {
-
-      if (msg instanceof WebSocketMessage.TextMessage) {
-
-         sendTextMessage((WebSocketMessage.TextMessage) msg);
-
-      } else if (msg instanceof WebSocketMessage.RawTextMessage) {
-
-         sendRawTextMessage((WebSocketMessage.RawTextMessage) msg);
-
-      } else if (msg instanceof WebSocketMessage.BinaryMessage) {
-
-         sendBinaryMessage((WebSocketMessage.BinaryMessage) msg);
-
-      } else if (msg instanceof WebSocketMessage.Ping) {
-
-         sendPing((WebSocketMessage.Ping) msg);
-
-      } else if (msg instanceof WebSocketMessage.Pong) {
-
-         sendPong((WebSocketMessage.Pong) msg);
-
-      } else if (msg instanceof WebSocketMessage.Close) {
-
-         sendClose((WebSocketMessage.Close) msg);
-
-      } else if (msg instanceof WebSocketMessage.ClientHandshake) {
-
-         sendClientHandshake((WebSocketMessage.ClientHandshake) msg);
-
-      } else if (msg instanceof WebSocketMessage.Quit) {
-
-         mLooper.quit();
-
-         if  (DEBUG) Log.d(TAG, "ended");
-
-         return;
-
-      } else {
-
-         // call hook which may be overridden in derived class to process
-         // messages we don't understand in this class
-         processAppMessage(msg);
-      }
-   }
-
-
-   /**
-    * Process message other than plain WebSockets or control message.
-    * This is intended to be overridden in derived classes.
-    *
-    * @param msg      Message from foreground thread to process.
-    */
-   protected void processAppMessage(Object msg) throws WebSocketException, IOException {
-
-      throw new WebSocketException("unknown message received by WebSocketWriter");
-   }
+public class WebSocketWriter extends Thread {
+	private static final String TAG = WebSocketWriter.class.getCanonicalName();
+	
+	private static final int WEB_SOCKETS_VERSION = 13;
+	private static final String CRLF = "\r\n";
+
+	private final Random mRandom = new Random();
+	private final Handler mWebSocketConnectionHandler;
+	private final WebSocketOptions mWebSocketOptions;
+	private final ByteBuffer mApplicationBuffer;
+	private final Socket mSocket;
+
+	private OutputStream mOutputStream;
+
+	private Handler mHandler;
+
+
+	/**
+	 * Create new WebSockets background writer.
+	 *
+	 * @param looper    The message looper of the background thread on which
+	 *                  this object is running.
+	 * @param master    The message handler of master (foreground thread).
+	 * @param socket    The socket channel created on foreground thread.
+	 * @param options   WebSockets connection options.
+	 */
+	public WebSocketWriter(Handler master, Socket socket, WebSocketOptions options, String threadName) {
+		super(threadName);
+
+		this.mWebSocketConnectionHandler = master;
+		this.mWebSocketOptions = options;
+		this.mSocket = socket;
+		
+		this.mApplicationBuffer = ByteBuffer.allocate(options.getMaxFramePayloadSize() + 14);
+
+		Log.d(TAG, "WebSocket writer created.");
+	}
+
+
+	/**
+	 * Call this from the foreground (UI) thread to make the writer
+	 * (running on background thread) send a WebSocket message on the
+	 * underlying TCP.
+	 *
+	 * @param message       Message to send to WebSockets writer. An instance of the message
+	 *                      classes inside WebSocketMessage or another type which then needs
+	 *                      to be handled within processAppMessage() (in a class derived from
+	 *                      this class).
+	 */
+	public void forward(Object message) {
+		Message msg = mHandler.obtainMessage();
+		msg.obj = message;
+		mHandler.sendMessage(msg);
+	}
+
+
+	/**
+	 * Notify the master (foreground thread).
+	 *
+	 * @param message       Message to send to master.
+	 */
+	private void notify(Object message) {
+		Message msg = mWebSocketConnectionHandler.obtainMessage();
+		msg.obj = message;
+		mWebSocketConnectionHandler.sendMessage(msg);
+	}
+
+
+	/**
+	 * Create new key for WebSockets handshake.
+	 *
+	 * @return WebSockets handshake key (Base64 encoded).
+	 */
+	private String newHandshakeKey() {
+		final byte[] ba = new byte[16];
+		mRandom.nextBytes(ba);
+		return Base64.encodeToString(ba, Base64.NO_WRAP);
+	}
+
+
+	/**
+	 * Create new (random) frame mask.
+	 *
+	 * @return Frame mask (4 octets).
+	 */
+	private byte[] newFrameMask() {
+		final byte[] ba = new byte[4];
+		mRandom.nextBytes(ba);
+		return ba;
+	}
+
+
+	/**
+	 * Send WebSocket client handshake.
+	 */
+	private void sendClientHandshake(WebSocketMessage.ClientHandshake message) throws IOException {
+		String path = message.getURI().getPath();
+		if (path == null || path.length() == 0) {
+			path = "/";
+		}
+
+        String query = message.getURI().getQuery();
+        if (query != null && query.length() > 0) {
+    		path = path + "?" + query;
+    	}
+
+        mApplicationBuffer.put(("GET " + path + " HTTP/1.1" + CRLF).getBytes());
+		mApplicationBuffer.put(("Host: " + message.getURI().getHost() + CRLF).getBytes());
+		mApplicationBuffer.put(("Upgrade: WebSocket" + CRLF).getBytes());
+		mApplicationBuffer.put(("Connection: Upgrade" + CRLF).getBytes());
+		mApplicationBuffer.put(("Sec-WebSocket-Key: " + newHandshakeKey() + CRLF).getBytes());
+
+		if (message.getOrigin() != null) {
+			mApplicationBuffer.put(("Origin: " + message.getOrigin().toString() + CRLF).getBytes());
+		}
+
+		if (message.getSubprotocols() != null && message.getSubprotocols().length > 0) {
+			mApplicationBuffer.put(("Sec-WebSocket-Protocol: ").getBytes());
+			for (int i = 0; i < message.getSubprotocols().length; ++i) {
+				mApplicationBuffer.put((message.getSubprotocols()[i]).getBytes());
+				mApplicationBuffer.put((", ").getBytes());
+			}
+			mApplicationBuffer.put((CRLF).getBytes());
+		}
+
+		mApplicationBuffer.put(("Sec-WebSocket-Version: " + WEB_SOCKETS_VERSION + CRLF).getBytes());
+		mApplicationBuffer.put((CRLF).getBytes());
+	}
+
+
+	/**
+	 * Send WebSockets close.
+	 */
+	private void sendClose(WebSocketMessage.Close message) throws IOException, WebSocketException {
+		if (message.getCode() > 0) {
+			byte[] payload = null;
+
+			if (message.getReason() != null && !(message.getReason().length() > 0)) {
+				byte[] pReason = message.getReason().getBytes(WebSocket.UTF8_ENCODING);
+				payload = new byte[2 + pReason.length];
+				for (int i = 0; i < pReason.length; ++i) {
+					payload[i + 2] = pReason[i];
+				}
+			} else {
+				payload = new byte[2];
+			}
+
+			if (payload != null && payload.length > 125) {
+				throw new WebSocketException("close payload exceeds 125 octets");
+			}
+
+			payload[0] = (byte)((message.getCode() >> 8) & 0xff);
+			payload[1] = (byte)(message.getCode() & 0xff);
+
+			sendFrame(8, true, payload);
+		} else {
+			sendFrame(8, true, null);
+		}
+	}
+
+
+	/**
+	 * Send WebSockets ping.
+	 */
+	private void sendPing(WebSocketMessage.Ping message) throws IOException, WebSocketException {
+		if (message.mPayload != null && message.mPayload.length > 125) {
+			throw new WebSocketException("ping payload exceeds 125 octets");
+		}
+		sendFrame(9, true, message.mPayload);
+	}
+
+
+	/**
+	 * Send WebSockets pong. Normally, unsolicited Pongs are not used,
+	 * but Pongs are only send in response to a Ping from the peer.
+	 */
+	private void sendPong(WebSocketMessage.Pong message) throws IOException, WebSocketException {
+		if (message.mPayload != null && message.mPayload.length > 125) {
+			throw new WebSocketException("pong payload exceeds 125 octets");
+		}
+		sendFrame(10, true, message.mPayload);
+	}
+
+
+	/**
+	 * Send WebSockets binary message.
+	 */
+	private void sendBinaryMessage(WebSocketMessage.BinaryMessage message) throws IOException, WebSocketException {
+		if (message.mPayload.length > mWebSocketOptions.getMaxMessagePayloadSize()) {
+			throw new WebSocketException("message payload exceeds payload limit");
+		}
+		sendFrame(2, true, message.mPayload);
+	}
+
+
+	/**
+	 * Send WebSockets text message.
+	 */
+	private void sendTextMessage(WebSocketMessage.TextMessage message) throws IOException, WebSocketException {
+		byte[] payload = message.mPayload.getBytes(WebSocket.UTF8_ENCODING);
+		if (payload.length > mWebSocketOptions.getMaxMessagePayloadSize()) {
+			throw new WebSocketException("message payload exceeds payload limit");
+		}
+		sendFrame(1, true, payload);
+	}
+
+
+	/**
+	 * Send WebSockets binary message.
+	 */
+	private void sendRawTextMessage(WebSocketMessage.RawTextMessage message) throws IOException, WebSocketException {
+		if (message.mPayload.length > mWebSocketOptions.getMaxMessagePayloadSize()) {
+			throw new WebSocketException("message payload exceeds payload limit");
+		}
+		sendFrame(1, true, message.mPayload);
+	}
+
+
+	/**
+	 * Sends a WebSockets frame. Only need to use this method in derived classes which implement
+	 * more message types in processAppMessage(). You need to know what you are doing!
+	 *
+	 * @param opcode     The WebSocket frame opcode.
+	 * @param fin        FIN flag for WebSocket frame.
+	 * @param payload    Frame payload or null.
+	 */
+	protected void sendFrame(int opcode, boolean fin, byte[] payload) throws IOException {
+		if (payload != null) {
+			sendFrame(opcode, fin, payload, 0, payload.length);
+		} else {
+			sendFrame(opcode, fin, null, 0, 0);
+		}
+	}
+
+
+	/**
+	 * Sends a WebSockets frame. Only need to use this method in derived classes which implement
+	 * more message types in processAppMessage(). You need to know what you are doing!
+	 *
+	 * @param opcode     The WebSocket frame opcode.
+	 * @param fin        FIN flag for WebSocket frame.
+	 * @param payload    Frame payload or null.
+	 * @param offset     Offset within payload of the chunk to send.
+	 * @param length     Length of the chunk within payload to send.
+	 */
+	protected void sendFrame(int opcode, boolean fin, byte[] payload, int offset, int length) throws IOException {
+		// first octet
+		byte b0 = 0;
+		if (fin) {
+			b0 |= (byte) (1 << 7);
+		}
+		b0 |= (byte) opcode;
+		mApplicationBuffer.put(b0);
+
+		// second octet
+		byte b1 = 0;
+		if (mWebSocketOptions.getMaskClientFrames()) {
+			b1 = (byte) (1 << 7);
+		}
+
+		long len = length;
+
+		// extended payload length
+		if (len <= 125) {
+			b1 |= (byte) len;
+			mApplicationBuffer.put(b1);
+		} else if (len <= 0xffff) {
+			b1 |= (byte) (126 & 0xff);
+			mApplicationBuffer.put(b1);
+			mApplicationBuffer.put(new byte[] {(byte)((len >> 8) & 0xff), (byte)(len & 0xff)});
+		} else {
+			b1 |= (byte) (127 & 0xff);
+			mApplicationBuffer.put(b1);
+			mApplicationBuffer.put(new byte[] {(byte)((len >> 56) & 0xff),
+					(byte)((len >> 48) & 0xff),
+					(byte)((len >> 40) & 0xff),
+					(byte)((len >> 32) & 0xff),
+					(byte)((len >> 24) & 0xff),
+					(byte)((len >> 16) & 0xff),
+					(byte)((len >> 8)  & 0xff),
+					(byte)(len         & 0xff)});
+		}
+
+		byte mask[] = null;
+		if (mWebSocketOptions.getMaskClientFrames()) {
+			// a mask is always needed, even without payload
+			mask = newFrameMask();
+			mApplicationBuffer.put(mask[0]);
+			mApplicationBuffer.put(mask[1]);
+			mApplicationBuffer.put(mask[2]);
+			mApplicationBuffer.put(mask[3]);
+		}
+
+		if (len > 0) {
+			if (mWebSocketOptions.getMaskClientFrames()) {
+				/// \todo optimize masking
+				/// \todo masking within buffer of output stream
+				for (int i = 0; i < len; ++i) {
+					payload[i + offset] ^= mask[i % 4];
+				}
+			}
+			mApplicationBuffer.put(payload, offset, length);
+		}
+	}
+
+	/**
+	 * Process WebSockets or control message from master. Normally,
+	 * there should be no reason to override this. If you do, you
+	 * need to know what you are doing.
+	 *
+	 * @param msg     An instance of the message types within WebSocketMessage
+	 *                or a message that is handled in processAppMessage().
+	 */
+	protected void processMessage(Object msg) throws IOException, WebSocketException {
+
+		if (msg instanceof WebSocketMessage.TextMessage) {
+			sendTextMessage((WebSocketMessage.TextMessage) msg);
+		} else if (msg instanceof WebSocketMessage.RawTextMessage) {
+			sendRawTextMessage((WebSocketMessage.RawTextMessage) msg);
+		} else if (msg instanceof WebSocketMessage.BinaryMessage) {
+			sendBinaryMessage((WebSocketMessage.BinaryMessage) msg);
+		} else if (msg instanceof WebSocketMessage.Ping) {
+			sendPing((WebSocketMessage.Ping) msg);
+		} else if (msg instanceof WebSocketMessage.Pong) {
+			sendPong((WebSocketMessage.Pong) msg);
+		} else if (msg instanceof WebSocketMessage.Close) {
+			sendClose((WebSocketMessage.Close) msg);
+		} else if (msg instanceof WebSocketMessage.ClientHandshake) {
+			sendClientHandshake((WebSocketMessage.ClientHandshake) msg);
+		} else if (msg instanceof WebSocketMessage.Quit) {
+			Looper.myLooper().quit();
+
+			Log.d(TAG, "WebSocket writer ended.");
+		} else {
+			processAppMessage(msg);
+		}
+	}
+
+	public void writeMessageToBuffer(Message message) {
+		try {
+			mApplicationBuffer.clear();
+			processMessage(message.obj);
+			mApplicationBuffer.flip();
+
+			mOutputStream.write(mApplicationBuffer.array(), mApplicationBuffer.position(), mApplicationBuffer.limit());
+		} catch (SocketException e) {
+			Log.e(TAG, "run() : SocketException (" + e.toString() + ")");
+
+			notify(new WebSocketMessage.ConnectionLost());
+		} catch (IOException e) {
+			Log.e(TAG, "run() : IOException (" + e.toString() + ")");
+
+		} catch (Exception e) {
+			notify(new WebSocketMessage.Error(e));
+		}
+	}
+
+	/**
+	 * Process message other than plain WebSockets or control message.
+	 * This is intended to be overridden in derived classes.
+	 *
+	 * @param msg      Message from foreground thread to process.
+	 */
+	protected void processAppMessage(Object msg) throws WebSocketException, IOException {
+		throw new WebSocketException("unknown message received by WebSocketWriter");
+	}
+
+
+
+	// Thread method overrides
+	@Override
+	public void run() {	
+		OutputStream outputStream = null;
+		try {
+			outputStream = mSocket.getOutputStream();
+		} catch (IOException e) {
+			Log.e(TAG, e.getLocalizedMessage());
+		}
+		
+		this.mOutputStream = outputStream;
+		
+		Looper.prepare();
+
+		this.mHandler = new ThreadHandler(this);
+
+		synchronized (this) {
+			Log.d(TAG, "WebSocker writer running.");
+
+			notifyAll();
+		}
+
+		Looper.loop();
+	}
+
+
+
+	//
+	// Private handler class
+	private static class ThreadHandler extends Handler {
+		private final WeakReference<WebSocketWriter> mWebSocketWriterReference;
+
+
+
+		public ThreadHandler(WebSocketWriter webSocketWriter) {
+			super();
+
+			this.mWebSocketWriterReference = new WeakReference<WebSocketWriter>(webSocketWriter);
+		}
+
+
+
+		@Override
+		public void handleMessage(Message message) {
+			WebSocketWriter webSocketWriter = mWebSocketWriterReference.get();
+			if (webSocketWriter != null) {
+				webSocketWriter.writeMessageToBuffer(message);
+			}
+		}
+	}
 }
